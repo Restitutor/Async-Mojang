@@ -1,48 +1,25 @@
+"""Smoke tests against the live Mojang API."""
+
 import asyncio
+
 from async_mojang import API
 
-async def get_uuid(username: str):
+
+async def main() -> None:
     async with API() as api:
-        uuid = await api.get_uuid(username)
-        return uuid
+        uid = await api.get_uuid("FroostySnoowman")
+        print(f"UUID       : {uid}")
 
-async def get_formatted_uuid(username: str):
-    async with API() as api:
-        formatted_uuid = await api.get_formatted_uuid(username)
-        return formatted_uuid
+        if uid is not None:
+            username = await api.get_username(uid)
+            print(f"Username   : {username}")
 
-async def get_stripped_uuid(username: str):
-    async with API() as api:
-        stripped_uuid = await api.get_stripped_uuid(username)
-        return stripped_uuid
+            profile = await api.get_profile(uid)
+            print(f"Profile    : {profile}")
 
-async def get_username(uuid: str):
-    async with API() as api:
-        username = await api.get_username(uuid)
-        return username
+        servers = await api.get_blocked_servers()
+        print(f"Blocked    : {len(servers)} servers")
 
-async def get_profile(uuid: str):
-    async with API() as api:
-        profile = await api.get_profile(uuid)
-        return profile
-
-async def get_blocked_servers():
-    async with API() as api:
-        blocked_servers = await api.get_blocked_servers()
-        return blocked_servers
-
-async def main():
-    uuid = await get_uuid("FroostySnoowman")
-    print(uuid)
-
-    username = await get_username(uuid)
-    print(username)
-
-    profile = await get_profile(uuid)
-    print(profile)
-
-    blocked_servers = await get_blocked_servers()
-    print(blocked_servers)
 
 if __name__ == "__main__":
     asyncio.run(main())

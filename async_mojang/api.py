@@ -1,104 +1,167 @@
-import ast
-import json
-import base64
-from typing import List, Dict, Optional
+"""Public async API for Mojang services."""
 
+import base64
+import binascii
+import json
+import uuid
+from typing import Any
+
+import aiohttp
+
+from async_mojang._http_client import _DEFAULT_MAX_ATTEMPTS, _HTTPClient
 from async_mojang._types import UserProfile
-from async_mojang._http_client import _HTTPClient
-from async_mojang.errors import MojangError
+from async_mojang._utils import _assert_valid_username, _parse_uuid
+from async_mojang.errors import BadRequest, MalformedResponse, NotFound
 
 _API_BASE_URL = "https://api.mojang.com"
 _SESSIONSERVER_BASE_URL = "https://sessionserver.mojang.com"
 _UUID_API_URL = "https://api.minecraftservices.com/minecraft/profile/lookup/name"
 
-class API(_HTTPClient):
-    async def get_uuid(self, username: str) -> Optional[str]:
-        url = f"{_UUID_API_URL}/{username}"
+_MAX_BATCH = 10  # API limitation
 
+# Mojang endpoints may return 400 or 404 for "player not found".
+# We map both to None in lookup methods.
+_NOT_FOUND_ERRORS = (NotFound, BadRequest)
+
+
+class API:
+    """Async Mojang API client.
+
+    Example:
+        async with API() as api:
+            player = await api.get_uuid("Notch")
+            profile = await api.get_profile(player)
+    """
+
+    def __init__(
+        self,
+        session: aiohttp.ClientSession | None = None,
+        *,
+        retry_on_ratelimit: bool = False,
+        ratelimit_sleep_time: float = 60,
+        max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
+    ) -> None:
+        self._http = _HTTPClient(
+            session,
+            retry_on_ratelimit=retry_on_ratelimit,
+            ratelimit_sleep_time=ratelimit_sleep_time,
+            max_attempts=max_attempts,
+        )
+
+    async def get_uuid(self, username: str) -> uuid.UUID | None:
+        """Look up a player's UUID by username, or None if not found."""
+        _assert_valid_username(username)
         try:
-            resp = await self.request("GET", url, ignore_codes=[400])
-            data = await resp.json()
-            uuid = data["id"].replace("-", "")
-
-            formatted_uuid = (
-                uuid[:8] + '-' +
-                uuid[8:12] + '-' +
-                uuid[12:16] + '-' +
-                uuid[16:20] + '-' +
-                uuid[20:]
+            data: dict[str, Any] = await self._http._get_json(
+                f"{_UUID_API_URL}/{username}",
             )
-
-            return formatted_uuid
-        except (KeyError, json.decoder.JSONDecodeError):
+        except _NOT_FOUND_ERRORS:
             return None
 
-    async def get_stripped_uuid(self, username: str) -> Optional[str]:
-        url = f"{_UUID_API_URL}/{username}"
-
         try:
-            resp = await self.request("GET", url, ignore_codes=[400])
-            data = await resp.json()
-            return data["id"].replace("-", "")
-        except (KeyError, json.decoder.JSONDecodeError):
+            raw = data["id"]
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise MalformedResponse(
+                detail=f"UUID lookup response missing 'id': {exc}",
+            ) from exc
+
+        return uuid.UUID(raw) if raw else None
+
+    async def get_uuids(self, names: list[str]) -> dict[str, uuid.UUID]:
+        """Batch-convert up to 10 usernames to UUIDs.
+
+        The returned dict is keyed by the server-returned casing
+        (e.g. input "notch" -> key "Notch").
+        """
+        if len(names) > _MAX_BATCH:
+            raise ValueError(
+                f"Mojang batch API accepts at most {_MAX_BATCH} names, got {len(names)}",
+            )
+        for name in names:
+            _assert_valid_username(name)
+        try:
+            data: list[dict[str, Any]] = await self._http._post_json(
+                f"{_API_BASE_URL}/profiles/minecraft",
+                json=names,
+            )
+        except _NOT_FOUND_ERRORS:
+            return {}
+        try:
+            return {entry["name"]: uuid.UUID(entry["id"]) for entry in data}
+        except (TypeError, KeyError, ValueError) as exc:
+            raise MalformedResponse(
+                detail=f"Unexpected batch-lookup response shape: {exc}",
+            ) from exc
+
+    async def get_username(self, player: uuid.UUID | str) -> str | None:
+        """Convert a UUID to its current username, or None if not found."""
+        uid = _parse_uuid(player)
+        try:
+            data: dict[str, Any] = await self._http._get_json(
+                f"{_SESSIONSERVER_BASE_URL}/session/minecraft/profile/{uid.hex}",
+            )
+        except _NOT_FOUND_ERRORS:
             return None
-
-    async def get_uuids(self, names: List[str]) -> Dict[str, str]:
-        """Convert up to 10 usernames to UUIDs in a single network request."""
-        if len(names) > 10:
-            names = names[:10]
-
-        resp = await self.request(
-            "POST",
-            f"{_API_BASE_URL}/profiles/minecraft",
-            ignore_codes=[400],
-            json=names,
-        )
-        data = await resp.json()
-        if not isinstance(data, list):
-            raise MojangError(response=resp)
-        return {name_data["name"]: name_data["id"] for name_data in data}
-
-    async def get_username(self, uuid: str) -> Optional[str]:
-        """Convert a UUID to a username."""
-        resp = await self.request(
-            "GET",
-            f"{_SESSIONSERVER_BASE_URL}/session/minecraft/profile/{uuid}",
-            ignore_codes=[400],
-        )
-
         try:
-            data = await resp.json()
             return data["name"]
-        except json.decoder.JSONDecodeError:
-            return None
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise MalformedResponse(
+                detail=f"Profile response missing 'name': {exc}",
+            ) from exc
 
-    async def get_profile(self, uuid: str) -> Optional[UserProfile]:
-        """Get more information about a user from their UUID."""
-        resp = await self.request(
-            "GET",
-            f"{_SESSIONSERVER_BASE_URL}/session/minecraft/profile/{uuid}",
-            ignore_codes=[400],
-        )
-
+    async def get_profile(self, player: uuid.UUID | str) -> UserProfile | None:
+        """Full profile with decoded texture data, or None if not found."""
+        uid = _parse_uuid(player)
         try:
-            properties = await resp.json()
-            value = properties["properties"][0]["value"]
-            data = ast.literal_eval(base64.b64decode(value).decode())
-
-            return UserProfile(
-                id=data["profileId"],
-                timestamp=data["timestamp"],
-                name=data["profileName"],
-                is_legacy_profile=bool(data.get("legacy")),
-                cape_url=data["textures"].get("CAPE", {}).get("url"),
-                skin_url=data["textures"].get("SKIN", {}).get("url"),
-                skin_variant=data["textures"].get("SKIN", {}).get("metadata", {}).get("model", "classic"),
+            data: dict[str, Any] = await self._http._get_json(
+                f"{_SESSIONSERVER_BASE_URL}/session/minecraft/profile/{uid.hex}",
             )
-        except (KeyError, json.decoder.JSONDecodeError):
+        except _NOT_FOUND_ERRORS:
             return None
+        return _parse_profile(data)
 
-    async def get_blocked_servers(self) -> List[str]:
-        """Get a list of SHA1 hashes of blacklisted Minecraft servers."""
-        resp = await self.request("GET", f"{_SESSIONSERVER_BASE_URL}/blockedservers")
-        data = await resp.text()
-        return data.splitlines()
+    async def get_blocked_servers(self) -> list[str]:
+        """SHA-1 hashes of blocked Minecraft servers."""
+        text: str = await self._http._get_text(
+            f"{_SESSIONSERVER_BASE_URL}/blockedservers"
+        )
+        return text.splitlines()
+
+    async def close(self) -> None:
+        """Close the underlying HTTP session."""
+        await self._http.close()
+
+    async def __aenter__(self) -> "API":
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.close()
+
+
+def _parse_profile(data: dict[str, Any]) -> UserProfile:
+    """Decode the base64 textures blob into a UserProfile."""
+    try:
+        value = data["properties"][0]["value"]
+        decoded: dict[str, Any] = json.loads(base64.b64decode(value))
+    except (KeyError, IndexError, json.JSONDecodeError, binascii.Error) as exc:
+        raise MalformedResponse(
+            detail=f"Cannot decode profile textures: {exc}",
+        ) from exc
+
+    textures: dict[str, Any] = decoded.get("textures", {})
+    skin: dict[str, Any] = textures.get("SKIN", {})
+
+    try:
+        return UserProfile(
+            id=uuid.UUID(decoded["profileId"]),
+            timestamp=decoded["timestamp"],
+            name=decoded["profileName"],
+            is_legacy_profile=bool(decoded.get("legacy")),
+            skin_url=skin.get("url"),
+            skin_variant=skin.get("metadata", {}).get("model", "classic"),
+            cape_url=textures.get("CAPE", {}).get("url"),
+        )
+    except (KeyError, ValueError) as exc:
+        raise MalformedResponse(
+            detail=f"Profile payload missing or invalid field: {exc}",
+        ) from exc
