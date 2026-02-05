@@ -3,3 +3,4 @@ build
 dist
 async_mojang.egg-info
 DEV-README.md
+.DS_Store
