@@ -71,6 +71,6 @@ async with API() as api:
 api = API(
     retry_on_ratelimit=True,       # auto-retry on HTTP 429
     ratelimit_sleep_time=60,       # seconds to wait before retry
-    max_attempts=5,                # max retries for transient 5xx errors
+    max_attempts=5,                # max total attempts (covers 5xx backoff and 429 retries)
 )
 ```
