@@ -120,6 +120,7 @@ class _HTTPClient:
                     continue
                 await self._raise_for_status(resp)
 
+        raise AssertionError("unreachable")
     async def _maybe_retry(
         self,
         resp: aiohttp.ClientResponse,
