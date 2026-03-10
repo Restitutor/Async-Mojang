@@ -27,6 +27,9 @@ async def main():
         # Username -> UUID
         player: uuid.UUID | None = await api.get_uuid("FroostySnoowman")
         print(player)            # 069a79f4-...  (uuid.UUID object)
+        if player is None:
+            print("Player not found")
+            return
         print(player.hex)        # 069a79f4...   (stripped, replaces get_stripped_uuid)
 
         # Batch lookup (up to 10 names)
